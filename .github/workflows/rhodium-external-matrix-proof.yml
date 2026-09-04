@@ -1,0 +1,382 @@
+name: Rhodium External Matrix Proof
+
+on:
+  workflow_dispatch:
+    inputs:
+      size_mib:
+        description: "Physical Matrix test size in MiB"
+        required: true
+        default: "1024"
+
+permissions:
+  contents: read
+  id-token: write
+  attestations: write
+
+jobs:
+  external-matrix-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      EXPECTED_ENGINE_SHA256: "55672321E50A48C7AD9673950D8A5C315CE3EDA225A2CB0101CCAA7CC51135C1"
+      EXPECTED_HARNESS_SHA256: "AC459654CC3249E1652EC2A3CADDBA34A3CF29A23315E97A92DCD8E7EF00C53D"
+      TEST_SIZE_MIB: "${{ inputs.size_mib }}"
+
+    steps:
+
+      - name: GitHub hosted runner identity
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          echo "EXECUTION_INFRASTRUCTURE=GITHUB_HOSTED_RUNNER"
+          echo "GITHUB_RUN_ID=$GITHUB_RUN_ID"
+          echo "GITHUB_REPOSITORY=$GITHUB_REPOSITORY"
+          echo "GITHUB_SHA=$GITHUB_SHA"
+          echo "RUNNER_OS=$RUNNER_OS"
+          echo "RUNNER_ARCH=$RUNNER_ARCH"
+          echo "VENDOR_LOCAL_MACHINE=NO"
+
+      - name: Validate test size
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          SIZE="$TEST_SIZE_MIB"
+
+          [[ "$SIZE" =~ ^[0-9]+$ ]] || exit 10
+          (( SIZE >= 256 && SIZE <= 2048 )) || exit 11
+
+          echo "PHYSICAL_TEST_SIZE_MIB=$SIZE"
+
+      - name: Materialize sealed runtime
+        shell: bash
+        env:
+          A: ${{ secrets.RG_ENGINE_GZ_B64 }}
+          B: ${{ secrets.RG_HARNESS_GZ_B64 }}
+
+        run: |
+          set -Eeuo pipefail
+
+          umask 077
+
+          test -n "$A" || exit 20
+          test -n "$B" || exit 21
+
+          mkdir -p .private-runtime
+
+          printf '%s' "$A" |
+            base64 --decode |
+            gzip -dc > .private-runtime/a.py
+
+          printf '%s' "$B" |
+            base64 --decode |
+            gzip -dc > .private-runtime/b.py
+
+          AH="$(
+            sha256sum .private-runtime/a.py |
+            awk '{print toupper($1)}'
+          )"
+
+          BH="$(
+            sha256sum .private-runtime/b.py |
+            awk '{print toupper($1)}'
+          )"
+
+          test "$AH" = "$EXPECTED_ENGINE_SHA256" || exit 22
+          test "$BH" = "$EXPECTED_HARNESS_SHA256" || exit 23
+
+          python3 -m py_compile \
+            .private-runtime/a.py \
+            .private-runtime/b.py \
+            >/dev/null 2>&1 || exit 24
+
+          echo "SEALED_RUNTIME_HASH_VALIDATION=PASS"
+
+      - name: Execute Matrix
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          mkdir -p remote-run
+
+          START_NS="$(date +%s%N)"
+
+          set +e
+
+          python3 .private-runtime/b.py \
+            --engine .private-runtime/a.py \
+            --workdir remote-run \
+            --size-mib "$TEST_SIZE_MIB" \
+            --pruefnummer "GITHUB-${GITHUB_RUN_ID}" \
+            --wiederherstellungsnummer "GITHUB-WH-${GITHUB_RUN_ID}" \
+            > .private-runtime/execution.log 2>&1
+
+          RC=$?
+
+          set -e
+
+          END_NS="$(date +%s%N)"
+
+          echo "$START_NS" > remote-run/start_ns.txt
+          echo "$END_NS" > remote-run/end_ns.txt
+
+          if [ "$RC" -ne 0 ]; then
+            echo "MATRIX_EXTERNAL_EXECUTION=FAIL"
+            echo "MATRIX_EXIT_CODE=$RC"
+            exit "$RC"
+          fi
+
+          echo "MATRIX_EXTERNAL_EXECUTION=COMPLETE"
+
+      - name: Verify result
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+
+          p = pathlib.Path("remote-run/report.json")
+
+          if not p.is_file():
+              raise SystemExit(30)
+
+          raw = p.read_bytes()
+
+          r = json.loads(
+              raw.decode("utf-8")
+          )
+
+          expected_bytes = (
+              int(os.environ["TEST_SIZE_MIB"])
+              * 1024
+              * 1024
+          )
+
+          valid = all([
+              r.get("status") ==
+                  "PASS_REAL_ROUNDTRIP",
+
+              r.get("source_bytes") ==
+                  expected_bytes,
+
+              r.get("cold", {})
+                  .get("hash_match") is True,
+
+              r.get("cold", {})
+                  .get("bit_identical") is True,
+
+              r.get("warm", {})
+                  .get("hash_match") is True,
+
+              r.get("warm", {})
+                  .get("bit_identical") is True
+          ])
+
+          if not valid:
+              raise SystemExit(31)
+
+          start_ns = int(
+              pathlib.Path(
+                  "remote-run/start_ns.txt"
+              ).read_text().strip()
+          )
+
+          end_ns = int(
+              pathlib.Path(
+                  "remote-run/end_ns.txt"
+              ).read_text().strip()
+          )
+
+          seconds = (
+              end_ns - start_ns
+          ) / 1_000_000_000
+
+          report_hash = hashlib.sha256(
+              raw
+          ).hexdigest().upper()
+
+          safe = {
+              "schema":
+                  "RHODIUM-GITHUB-EXTERNAL-PROOF-V1",
+
+              "status":
+                  r["status"],
+
+              "execution_class":
+                  "THIRD_PARTY_HOSTED_VENDOR_AUTHORED",
+
+              "external_execution":
+                  True,
+
+              "github_hosted_runner":
+                  True,
+
+              "vendor_local_machine":
+                  False,
+
+              "independent_lab_certification":
+                  False,
+
+              "github_run_id":
+                  os.environ["GITHUB_RUN_ID"],
+
+              "github_repository":
+                  os.environ["GITHUB_REPOSITORY"],
+
+              "github_sha":
+                  os.environ["GITHUB_SHA"],
+
+              "runner_os":
+                  os.environ.get("RUNNER_OS"),
+
+              "runner_arch":
+                  os.environ.get("RUNNER_ARCH"),
+
+              "source_bytes":
+                  r["source_bytes"],
+
+              "source_sha256":
+                  r["source_sha256"],
+
+              "cold_wire_bytes":
+                  r["cold"]["wire_sent_bytes"],
+
+              "cold_reduction_percent":
+                  r["cold"][
+                      "transfer_reduction_percent"
+                  ],
+
+              "cold_hash_match":
+                  r["cold"]["hash_match"],
+
+              "cold_bit_identical":
+                  r["cold"]["bit_identical"],
+
+              "warm_wire_bytes":
+                  r["warm"]["wire_sent_bytes"],
+
+              "warm_reduction_percent":
+                  r["warm"][
+                      "transfer_reduction_percent"
+                  ],
+
+              "warm_blocks_reused":
+                  r["warm"]["blocks_reused"],
+
+              "warm_hash_match":
+                  r["warm"]["hash_match"],
+
+              "warm_bit_identical":
+                  r["warm"]["bit_identical"],
+
+              "execution_seconds":
+                  seconds,
+
+              "private_report_sha256":
+                  report_hash,
+
+              "private_code_committed":
+                  False
+          }
+
+          pathlib.Path(
+              "remote-safe-proof.json"
+          ).write_text(
+              json.dumps(
+                  safe,
+                  indent=2,
+                  sort_keys=True
+              ) + "\n",
+              encoding="utf-8"
+          )
+
+          print(
+              "FINAL_TEST_RESULT=" +
+              r["status"]
+          )
+
+          print(
+              "SOURCE_BYTES=" +
+              str(r["source_bytes"])
+          )
+
+          print(
+              "COLD_BIT_IDENTICAL=" +
+              str(
+                  r["cold"]["bit_identical"]
+              )
+          )
+
+          print(
+              "COLD_REDUCTION_PERCENT=" +
+              str(
+                  r["cold"][
+                      "transfer_reduction_percent"
+                  ]
+              )
+          )
+
+          print(
+              "WARM_BIT_IDENTICAL=" +
+              str(
+                  r["warm"]["bit_identical"]
+              )
+          )
+
+          print(
+              "WARM_BLOCKS_REUSED=" +
+              str(
+                  r["warm"]["blocks_reused"]
+              )
+          )
+
+          print(
+              "WARM_REDUCTION_PERCENT=" +
+              str(
+                  r["warm"][
+                      "transfer_reduction_percent"
+                  ]
+              )
+          )
+
+          print(
+              "EXECUTION_SECONDS=" +
+              str(seconds)
+          )
+
+          print(
+              "PRIVATE_REPORT_SHA256=" +
+              report_hash
+          )
+
+          print("SAFE_PROOF_CREATED=YES")
+
+          PY
+
+      - name: GitHub signed provenance attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: remote-safe-proof.json
+
+      - name: Upload safe proof
+        uses: actions/upload-artifact@v4
+        with:
+          name: rhodium-external-proof-${{ github.run_id }}
+          path: remote-safe-proof.json
+          retention-days: 90
+
+      - name: Destroy proprietary runtime
+        if: always()
+        shell: bash
+        run: |
+          rm -rf \
+            .private-runtime \
+            remote-run
+
+          echo "PRIVATE_RUNTIME_REMOVED=YES"
